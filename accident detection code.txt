@@ -1,0 +1,450 @@
+#include <SoftwareSerial.h>
+#include <TinyGPSPlus.h>
+#include <SoftwareWire.h> 
+#include <Wire.h>              // Standard Hardware I2C Library for LCD
+#include <LiquidCrystal_I2C.h> // I2C LCD Library
+
+// --- HARDWARE DEFINITIONS ---
+
+// GSM Module (SIM800C - Software Serial)
+// RX (Arduino D2) to TX (GSM), TX (Arduino D3) to RX (GSM)
+SoftwareSerial gsmSerial(2, 3); 
+
+// GPS Module (Software Serial)
+// RX (Arduino D10) to TX (GPS), TX (Arduino D11) to RX (GPS)
+SoftwareSerial gpsSerial(10, 11); 
+
+// --- LCD Display (16x2 I2C) ---
+// LCD Display connected to A4 (SDA) and A5 (SCL)
+const int LCD_I2C_ADDR = 0x27; // Common I2C address, verify yours (0x27 or 0x3F)
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 16, 2); 
+
+// --- Accelerometer Connection (MPU-6050 - Software I2C) ---
+// SDA is connected to A3, SCL is connected to A2
+const int MPU_ADDR = 0x68; // I2C address of the MPU-6050 (default: 0x68)
+const int MPU_SDA = A3;
+const int MPU_SCL = A2;
+// Initialize the SoftwareWire object for MPU-6050
+SoftwareWire mpuWire(MPU_SDA, MPU_SCL); 
+
+// --- ULTRASONIC SENSOR (HC-SR04) DEFINITIONS ---
+const int TRIG_PIN = 7; // Use Digital Pin 7 for Trigger
+const int ECHO_PIN = 8; // Use Digital Pin 8 for Echo
+#define NEAR_OBJECT_THRESHOLD_CM 10 // Object detection distance in centimeters
+
+// --- SYSTEM CONSTANTS ---
+#define SAMPLES 10                  // Number of samples for initial calibration
+
+// *** CRITICAL FIX: THRESHOLDS SET TO A REALISTIC RANGE (~0.1G to ~0.2G) ***
+// 1G is ~16384. A value of +/-1000 is a detectable, but safe, jolt.
+#define MIN_ACCEL_THRESHOLD -1000   // Minimum deviation threshold for accident detection 
+#define MAX_ACCEL_THRESHOLD 1000    // Maximum deviation threshold for accident detection
+const char* EMERGENCY_NUMBER = "+916363830575"; // Emergency Contact Number (Confirmed)
+
+// --- GLOBAL VARIABLES ---
+TinyGPSPlus gps_data; // GPS Object
+int16_t AccelX, AccelY, AccelZ; // Global variables for raw 16-bit MPU readings
+long duration; // Duration of the sound pulse travel (microseconds)
+int distance_cm; // Calculated distance to object (centimeters)
+bool near_object_detected = false; // Flag to indicate a close object
+
+int x_calibration_offset = 0;
+int y_calibration_offset = 0;
+int z_calibration_offset = 0;
+
+// --- FUNCTION PROTOTYPES ---
+void initModule(const char* cmd, const char* res, unsigned long timeout);
+void readMPU6050(); 
+bool processGPS();
+int readUltrasonicDistance(); 
+void SendSMS(double lat, double lon, float speed);
+void MakeCall(); 
+void gsmSerialFlush();
+
+// -----------------------------------------------------------------------------
+//                                SETUP
+// -----------------------------------------------------------------------------
+void setup()
+{
+  // Initialize communication
+  gsmSerial.begin(9600);
+  Serial.begin(9600);
+  gpsSerial.begin(9600);
+  mpuWire.begin(); 
+
+  // Initialize LCD (I2C)
+  lcd.init();      
+  lcd.backlight(); 
+  lcd.print("Accident Alert");
+  lcd.setCursor(0, 1);
+  lcd.print("    System     ");
+  delay(2000);
+
+  // ULTRASONIC SENSOR SETUP
+  pinMode(TRIG_PIN, OUTPUT); 
+  pinMode(ECHO_PIN, INPUT);  
+  Serial.println("Ultrasonic Sensor Initialized");
+
+  // MPU-6050 Initialization (Wake up the device)
+  mpuWire.beginTransmission(MPU_ADDR);
+  mpuWire.write(0x6B); // Power Management Register 1
+  mpuWire.write(0);    // Set to 0 to wake up MPU-6050
+  mpuWire.endTransmission(true);
+
+  // GSM Initialization
+  lcd.clear();
+  lcd.print("Initializing GSM");
+  lcd.setCursor(0, 1);
+  lcd.print("Please Wait...");
+
+  Serial.println("Initializing GSM...");
+  initModule("AT", "OK", 2000);
+  initModule("ATE0", "OK", 2000); 
+  initModule("AT+CPIN?", "READY", 2000);
+  initModule("AT+CMGF=1", "OK", 2000);
+  initModule("AT+CNMI=2,2,0,0,0", "OK", 2000);
+  Serial.println("GSM Initialized Successfully");
+
+  lcd.clear();
+  lcd.print("GSM Ready!");
+  delay(1000);
+
+  // Accelerometer Calibration
+  lcd.clear();
+  lcd.print("Calibrating ");
+  lcd.setCursor(0, 1);
+  lcd.print("MPU-6050...");
+
+  long x_sum = 0;
+  long y_sum = 0;
+  long z_sum = 0;
+
+  for (int i = 0; i < SAMPLES; i++)
+  {
+    readMPU6050(); 
+    x_sum += AccelX;
+    y_sum += AccelY;
+    z_sum += AccelZ;
+    delay(50); 
+  }
+
+  // Calculate digital offsets (average of samples)
+  x_calibration_offset = x_sum / SAMPLES;
+  y_calibration_offset = y_sum / SAMPLES;
+  z_calibration_offset = z_sum / SAMPLES;
+
+  Serial.print("X Offset: "); Serial.println(x_calibration_offset);
+  Serial.print("Y Offset: "); Serial.println(y_calibration_offset);
+  Serial.print("Z Offset: "); Serial.println(z_calibration_offset);
+
+  lcd.clear();
+  lcd.print("Calibration Done!");
+  delay(1000);
+
+  // GPS Initial Check
+  lcd.clear();
+  lcd.print("Waiting For GPS");
+  lcd.setCursor(0, 1);
+  lcd.print("    Lock...    ");
+
+  // Wait for a good fix before starting the main loop (or timeout)
+  unsigned long start_time = millis();
+  while (!gps_data.location.isValid() && (millis() - start_time < 30000)) 
+  {
+    processGPS(); 
+    if (gps_data.satellites.isValid()) {
+        lcd.setCursor(0,1);
+        lcd.print("Sats: ");
+        lcd.print(gps_data.satellites.value());
+        lcd.print("        ");
+    }
+  }
+
+  if (gps_data.location.isValid()) {
+    lcd.clear();
+    lcd.print("GPS Locked!");
+  } else {
+    lcd.clear();
+    lcd.print("GPS Timeout!");
+    lcd.setCursor(0, 1);
+    lcd.print("Using last pos...");
+  }
+  delay(2000);
+
+  lcd.clear();
+  lcd.print("System Ready");
+  Serial.println("System Ready..");
+}
+
+// -----------------------------------------------------------------------------
+//                                MAIN LOOP
+// -----------------------------------------------------------------------------
+void loop()
+{
+  // Non-blocking GPS data collection
+  processGPS();
+  
+  // Read current raw MPU-6050 values
+  readMPU6050(); 
+
+  // Read distance from ultrasonic sensor
+  distance_cm = readUltrasonicDistance();
+
+  // Calculate the difference (change in acceleration)
+  int x_deviation = x_calibration_offset - AccelX;
+  int y_deviation = y_calibration_offset - AccelY;
+  int z_deviation = z_calibration_offset - AccelZ;
+
+  // Check for close object
+  if (distance_cm > 0 && distance_cm <= NEAR_OBJECT_THRESHOLD_CM) {
+    near_object_detected = true;
+  } else {
+    near_object_detected = false;
+  }
+
+  // Print current deviation (for debugging)
+  Serial.print("X Dev: "); Serial.print(x_deviation);
+  Serial.print(" | Y Dev: "); Serial.print(y_deviation);
+  Serial.print(" | Z Dev: "); Serial.print(z_deviation);
+  Serial.print(" | Dist: "); Serial.print(distance_cm); Serial.println(" cm");
+
+  // LCD status update
+  lcd.setCursor(0, 0);
+  lcd.print("Lat:");
+  lcd.print(gps_data.location.lat(), 4);
+  lcd.print("      ");
+
+  lcd.setCursor(0, 1);
+  if (near_object_detected) {
+    lcd.print("!! OBSTACLE: ");
+    lcd.print(distance_cm);
+    lcd.print("CM !!");
+  } else {
+    lcd.print("Spd:");
+    lcd.print(gps_data.speed.knots(), 1);
+    lcd.print(" Knots");
+  }
+
+  // Check for accident condition (sudden extreme deviation)
+  if (x_deviation < MIN_ACCEL_THRESHOLD || x_deviation > MAX_ACCEL_THRESHOLD ||
+      y_deviation < MIN_ACCEL_THRESHOLD || y_deviation > MAX_ACCEL_THRESHOLD ||
+      z_deviation < MIN_ACCEL_THRESHOLD || z_deviation > MAX_ACCEL_THRESHOLD)
+  {
+    // Accident Detected!
+    lcd.clear();
+    lcd.print("ACCIDENT DETECTED!");
+    Serial.println("!!! ACCIDENT DETECTED !!!");
+    
+    // 1. Initiate Call ALERT immediately
+    lcd.setCursor(0, 1);
+    lcd.print("Calling Alert...");
+    Serial.println("Initiating Call Alert...");
+    MakeCall();
+    delay(5000); // Wait 5 seconds to ensure call connects/rings
+
+    // 2. Check for GPS fix and send SMS
+    if (gps_data.location.isValid())
+    {
+      double current_lat = gps_data.location.lat();
+      double current_lon = gps_data.location.lng();
+      float current_speed = gps_data.speed.knots();
+
+      lcd.setCursor(0, 1);
+      lcd.print("Sending SMS...");
+      Serial.println("Sending SMS Alert...");
+      
+      // Send the SMS
+      SendSMS(current_lat, current_lon, current_speed);
+
+      Serial.println("SMS Sent");
+      lcd.clear();
+      lcd.print("CALL & SMS SENT!");
+      delay(3000); // Pause after sending alert
+      
+    } else {
+      // If GPS is not valid, the call was still initiated.
+      lcd.setCursor(0, 1);
+      lcd.print("Call Sent. No GPS.");
+      delay(3000); 
+    }
+
+    lcd.clear();
+    lcd.print("System Ready");
+  }
+
+  // Small delay to prevent overwhelming the serial ports and allow reading
+  delay(100);
+}
+
+// -----------------------------------------------------------------------------
+//                            FUNCTION IMPLEMENTATIONS
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Reads raw 16-bit acceleration data from the MPU-6050 via Software I2C.
+ * Stores values in global variables AccelX, AccelY, AccelZ.
+ */
+void readMPU6050() {
+  mpuWire.beginTransmission(MPU_ADDR);
+  mpuWire.write(0x3B); // Start reading from ACCEL_XOUT_H register (0x3B)
+  mpuWire.endTransmission(false); // Do not release the bus (repeated start)
+  
+  // Request 6 bytes (2 bytes each for X, Y, Z acceleration)
+  mpuWire.requestFrom(MPU_ADDR, 6, true); 
+
+  // Combine high and low bytes to form 16-bit signed integers (int16_t)
+  AccelX = mpuWire.read() << 8 | mpuWire.read(); 
+  AccelY = mpuWire.read() << 8 | mpuWire.read();
+  AccelZ = mpuWire.read() << 8 | mpuWire.read();
+}
+
+/**
+ * @brief Measures the distance to an object using the HC-SR04 ultrasonic sensor.
+ * @return Distance in centimeters (cm). Returns 0 on timeout.
+ */
+int readUltrasonicDistance()
+{
+  // 1. Clear the trigger pin by setting it LOW for 2 microseconds
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  // 2. Trigger the sensor by setting the trigger pin HIGH for 10 microseconds
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // 3. Measure the duration of the echo pulse (time taken for the sound to return)
+  duration = pulseIn(ECHO_PIN, HIGH, 30000); 
+
+  if (duration == 0) {
+      return 0; // Return 0 if timeout occurred (likely no object in range)
+  }
+  
+  // 4. Calculate the distance: Distance (cm) = Duration (µs) / 58.2
+  return duration / 58; 
+}
+
+
+/**
+ * @brief Attempts to find a response string from the GSM module (gsmSerial).
+ */
+void initModule(const char* cmd, const char* res, unsigned long timeout)
+{
+  Serial.print("Sending: "); Serial.println(cmd);
+  
+  // Create a temporary non-const buffer to hold the response string for Stream::find()
+  char responseBuffer[10]; 
+  strncpy(responseBuffer, res, sizeof(responseBuffer) - 1);
+  responseBuffer[sizeof(responseBuffer) - 1] = '\0'; 
+
+  unsigned long start_time = millis();
+  while (millis() - start_time < timeout)
+  {
+    gsmSerialFlush(); // Clear any previous incoming data
+    gsmSerial.println(cmd);
+
+    unsigned long check_start = millis();
+    while (millis() - check_start < 1500) // Wait for up to 1.5s for the response
+    {
+      if (gsmSerial.available())
+      {
+        if (gsmSerial.find(responseBuffer)) // Look for the response string
+        {
+          Serial.print("Response: "); Serial.println(res);
+          return; // Success!
+        }
+      }
+    }
+    delay(500); // Short delay before re-sending the command
+  }
+  Serial.print("ERROR: Failed to get "); Serial.print(res); Serial.print(" response for: "); Serial.println(cmd);
+}
+
+/**
+ * @brief Feeds incoming GPS data to the TinyGPSPlus library in a non-blocking manner.
+ */
+bool processGPS()
+{
+  bool processed_data = false;
+  while (gpsSerial.available() > 0)
+  {
+    char c = gpsSerial.read();
+    if (gps_data.encode(c))
+    {
+      processed_data = true; 
+    }
+  }
+  return processed_data;
+}
+
+/**
+ * @brief Initiates a voice call to the emergency number using ATD command.
+ */
+void MakeCall()
+{
+  Serial.print("Initiating call to: ");
+  Serial.println(EMERGENCY_NUMBER);
+  
+  // ATD<number>; command initiates the voice call
+  gsmSerial.print("ATD");
+  gsmSerial.print(EMERGENCY_NUMBER);
+  gsmSerial.println(";"); // Semicolon is necessary to force voice call mode
+  
+  delay(1000); // Give GSM time to process the command
+}
+
+
+/**
+ * @brief Sends the accident alert SMS with coordinates and Google Maps link.
+ * @param lat Current latitude.
+ * @param lon Current longitude.
+ * @param speed Current speed in knots.
+ */
+void SendSMS(double lat, double lon, float speed)
+{
+  // 1. Set SMS text mode
+  gsmSerial.println("AT+CMGF=1");
+  delay(1000);
+  
+  // 2. Specify recipient number
+  gsmSerial.print("AT+CMGS=\""); 
+  gsmSerial.print(EMERGENCY_NUMBER);
+  gsmSerial.println("\"");     
+  delay(1000);
+
+  // 3. Write SMS content
+  gsmSerial.println("!!! URGENT ACCIDENT ALERT !!!");
+  gsmSerial.print("Location Coordinates:\nLat: ");
+  gsmSerial.print(lat, 6);
+  gsmSerial.print("\nLon: ");
+  gsmSerial.print(lon, 6);
+  gsmSerial.print("\nSpeed at Impact: ");
+  gsmSerial.print(speed, 1);
+  gsmSerial.println(" Knots");
+  
+  // Google Maps Link (FIXED: Correct Google Maps short URL format)
+  gsmSerial.println("\nGoogle Maps Link:");
+  gsmSerial.print("http://maps.google.com/maps?q="); 
+  gsmSerial.print(lat, 6);
+  gsmSerial.print(","); 
+  gsmSerial.println(lon, 6);
+
+  // 4. Send message (ASCII 26 is Ctrl+Z)
+  gsmSerial.write(26); 
+  delay(3000); // Give time for the message to be sent
+
+  // Read and print any final response from the GSM module
+  while(gsmSerial.available()) {
+      Serial.write(gsmSerial.read());
+  }
+}
+
+/**
+ * @brief Clears the incoming buffer of the GSM Serial port.
+ */
+void gsmSerialFlush()
+{
+  while (gsmSerial.available() > 0) {
+    gsmSerial.read();
+  }
+}\
